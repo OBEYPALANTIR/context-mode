@@ -1058,10 +1058,13 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
 
   async function longSession(agent, s, promptEvent) {
     for (const p of [...FILLER, ...FILLER]) await handleHook(agent, payload(s, { hook_event_name: promptEvent, prompt: p }), env);
-    await handleHook(agent, payload(s, {
-      hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "npm run migrate:zebraquux" },
-      tool_response: { stdout: "", stderr: "zebraquux migration failed: ETIMEDOUT connecting to db-replica-7", is_error: true },
-    }), env);
+    const failure = "zebraquux migration failed: ETIMEDOUT connecting to db-replica-7";
+    const post = agent === "gemini"
+      ? { hook_event_name: "AfterTool", tool_name: "run_shell_command", tool_input: { command: "npm run migrate:zebraquux" },
+          tool_response: { llmContent: failure, returnDisplay: failure, error: { message: failure } } }
+      : { hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "npm run migrate:zebraquux" },
+          tool_response: { stdout: "", stderr: failure, is_error: true } };
+    await handleHook(agent, payload(s, post), env);
     await waitRows("SELECT seq FROM events WHERE session_id = ?", [s], 2 * FILLER.length + 1);
   }
 
@@ -1092,6 +1095,18 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
     // below threshold: an unrelated prompt adds nothing
     const off = await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "what is the weather" }), env);
     assert.deepEqual(off, { stdout: "", exitCode: 0 });
+  });
+
+  test("[M7] recall/session-isolation: a compacted session never receives another session's rows", async () => {
+    const foreign = sid();
+    await longSession("claude-code", foreign, "UserPromptSubmit");
+    const foreignError = query("SELECT seq FROM events WHERE session_id = ? AND kind = 'toolerr'", foreign)[0];
+
+    const current = sid();
+    await longSession("claude-code", current, "UserPromptSubmit");
+    await handleHook("claude-code", payload(current, { hook_event_name: "SessionStart", source: "compact" }), env);
+    const text = context(await handleHook("claude-code", payload(current, { hook_event_name: "UserPromptSubmit", prompt: ASK_ERROR }), env));
+    assert.ok(text === null || !text.includes("#" + foreignError.seq + " "), String(text));
   });
 
   // #1330 (Lcstyle, aron-intframe): the first prompt is 30 KB of the README; a later output holds README lines and
@@ -1811,6 +1826,40 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     } finally {
       h.close();
     }
+  });
+
+  test("UserPromptSubmit entry keeps automatic recall inside its session", () => {
+    const foreign = "entry-recall-foreign";
+    const current = "entry-recall-current";
+    assert.equal(run(["--agent", "claude-code"], JSON.stringify({
+      session_id: foreign, cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "start foreign session",
+    })).status, 0);
+    const projects = join(root, ".context-mode", "projects");
+    const db = new DatabaseSync(join(projects, readdirSync(projects)[0], "context.db"));
+    let foreignSeq;
+    let currentSeq;
+    try {
+      const add = db.prepare("INSERT INTO events (session_id, worktree, agent, kind, tool, key, path, ok, exit_code, bytes, body, turn, created_at, accessed_at) VALUES (?, ?, 'claude-code', ?, ?, ?, NULL, ?, ?, ?, ?, 0, ?, ?)");
+      const now = Date.now();
+      const filler = Array.from({ length: 24 }, (_, i) => "unrelated release checklist item " + i);
+      for (const session of [foreign, current]) {
+        for (const body of filler) add.run(session, repo, "prompt", null, null, 1, null, Buffer.byteLength(body), body, now, now);
+        const result = add.run(session, repo, "toolerr", "Bash", 'Bash:{"command":"npm run migrate:zebraquux"}', 0, 1, 78, "zebraquux migration failed: ETIMEDOUT connecting to db-replica-7", now, now);
+        if (session === foreign) foreignSeq = Number(result.lastInsertRowid);
+        else currentSeq = Number(result.lastInsertRowid);
+      }
+      db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run("compacted:" + current, "1");
+    } finally {
+      db.close();
+    }
+
+    const result = run(["--agent", "claude-code"], JSON.stringify({
+      session_id: current, cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "why did the zebraquux migration fail with ETIMEDOUT",
+    }));
+    assert.equal(result.status, 0, result.stderr);
+    const text = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.ok(text.includes("#" + currentSeq + " "), text);
+    assert.ok(!text.includes("#" + foreignSeq + " "), text);
   });
 
   test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", () => {
